@@ -37,7 +37,28 @@
       <br/><em>Show detailed member information (useful for debugging)</em>
     </p>
   </fieldset>
-  
+
+  <fieldset>
+    <legend>Admin Group</legend>
+    <p>
+      <label>Redmine admins:</label>
+      <%
+        admin_options = @ad_groups.map { |g| [g.name, g.guid] }
+        # Keep the saved group selectable when AD is unreachable, so saving does not clear it
+        if @admin_group_guid.present? && admin_options.none? { |_, guid| guid == @admin_group_guid }
+          admin_options.unshift(["#{@admin_group_name.presence || @admin_group_guid} (not loaded from AD)", @admin_group_guid])
+        end
+      %>
+      <%= select_tag 'settings[admin_group_guid]',
+                     options_for_select(admin_options, @admin_group_guid),
+                     include_blank: 'None - admin rights not managed' %>
+      <br/><em>Members of this AD group (including nested groups) become Redmine admins, at every sync and at login. Other users of the selected LDAP authentication mode lose admin rights. Local accounts are never changed.</em>
+      <% if @ad_groups_error %>
+        <br/><em style="color: #c00;">Could not load groups from AD: <%= @ad_groups_error %></em>
+      <% end %>
+    </p>
+  </fieldset>
+
   <fieldset>
     <legend>Email Report</legend>
     <p>
@@ -76,6 +97,7 @@
         <tr><td style="padding: 8px; border-bottom: 1px solid #ddd;"><strong>Base DN:</strong></td><td style="padding: 8px; border-bottom: 1px solid #ddd;"><%= @auth.base_dn %></td></tr>
         <tr><td style="padding: 8px; border-bottom: 1px solid #ddd;"><strong>Groups DN:</strong></td><td style="padding: 8px; border-bottom: 1px solid #ddd;"><%= LdapSetting.get('ldap_groups_dn') || 'Not configured' %></td></tr>
         <tr><td style="padding: 8px; border-bottom: 1px solid #ddd;"><strong>Group Prefix:</strong></td><td style="padding: 8px; border-bottom: 1px solid #ddd;"><%= LdapSetting.get('ldap_group_prefix').presence || 'NONE (all groups)' %></td></tr>
+        <tr><td style="padding: 8px; border-bottom: 1px solid #ddd;"><strong>Admin Group:</strong></td><td style="padding: 8px; border-bottom: 1px solid #ddd;"><%= @admin_group_name.presence || 'NONE (admin rights not managed)' %></td></tr>
         <tr><td style="padding: 8px; border-bottom: 1px solid #ddd;"><strong>Verbose Logging:</strong></td><td style="padding: 8px; border-bottom: 1px solid #ddd;"><%= LdapSetting.get('verbose_logging') == 'true' ? '✅ Enabled' : '❌ Disabled' %></td></tr>
         <tr><td style="padding: 8px; border-bottom: 1px solid #ddd;"><strong>Report Email:</strong></td><td style="padding: 8px; border-bottom: 1px solid #ddd;"><%= LdapSetting.get('report_email').presence || 'Not configured' %></td></tr>
         <tr><td style="padding: 8px;"><strong>Send on changes only:</strong></td><td style="padding: 8px;"><%= LdapSetting.get('send_report_only_on_changes') == 'true' ? '✅ Yes' : '❌ No' %></td></tr>
@@ -119,7 +141,7 @@
       </thead>
       <tbody>
         <% @logs.each do |log| %>
-          <tr style="<%= 'color: #c00;' if log.message.include?('ERROR') %><%= 'color: #2a6;' if log.message.include?('Create') || log.message.include?('ADD') %><%= 'color: #e6b800;' if log.message.include?('LOCK') || log.message.include?('UNLOCK') %>">
+          <tr style="<%= 'color: #c00;' if log.message.include?('ERROR') %><%= 'color: #2a6;' if log.message.include?('Create') || log.message.include?('ADD') %><%= 'color: #e6b800;' if log.message.include?('LOCK') || log.message.include?('UNLOCK') %><%= 'color: #82c; font-weight: bold;' if log.message.include?('ADMIN') %>">
             <td style="white-space: nowrap; padding: 3px 5px;"><%= log.created_at.strftime('%Y-%m-%d %H:%M:%S') %></td>
             <td style="padding: 3px 5px;"><%= log.message %></td>
           </tr>

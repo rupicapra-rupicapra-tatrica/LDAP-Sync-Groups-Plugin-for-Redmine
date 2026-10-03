@@ -25,6 +25,15 @@ module LdapSyncGroups
       end
     end
 
+    # Sets the user's admin flag. Redmine notifies all admins about the change.
+    # Returns :granted, :revoked or nil when nothing changes.
+    def apply_admin(user, admin)
+      return if user.admin? == admin
+
+      user.update_attribute(:admin, admin) unless @dry_run
+      admin ? :granted : :revoked
+    end
+
     # Makes the group's members exactly the given users.
     # Returns [added, removed] users.
     def apply_group(group, users)

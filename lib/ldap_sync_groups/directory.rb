@@ -78,6 +78,18 @@ module LdapSyncGroups
       search(base, GROUP_FILTER, %w[cn objectGUID]).map { |e| to_group(e) }.sort_by { |g| g.name.downcase }
     end
 
+    # The group with the given objectGUID anywhere in the domain, or nil.
+    def find_group(guid)
+      filter = GROUP_FILTER & Net::LDAP::Filter.bineq('objectGUID', guid_to_binary(guid))
+      search(naming_context, filter, %w[cn objectGUID]).map { |e| to_group(e) }.first
+    end
+
+    # True if the user is a member of the group, directly or nested.
+    def member?(user_dn, group_dn)
+      filter = Net::LDAP::Filter.ex("member:#{IN_CHAIN}", Net::LDAP::Filter.escape(user_dn))
+      search(group_dn, filter, ['cn'], scope: Net::LDAP::SearchScope_BaseObject).any?
+    end
+
     # Groups below base that the user is a member of, directly or nested.
     def groups_of(user_dn, base)
       filter = GROUP_FILTER & Net::LDAP::Filter.ex("member:#{IN_CHAIN}", Net::LDAP::Filter.escape(user_dn))
@@ -124,6 +136,15 @@ module LdapSyncGroups
 
       b = raw.b
       [b[0, 4].reverse, b[4, 2].reverse, b[6, 2].reverse, b[8, 2], b[10, 6]].map { |part| part.unpack1('H*') }.join('-')
+    end
+
+    # The inverse of format_guid
+    def guid_to_binary(guid)
+      hex = guid.to_s.delete('-')
+      raise Error, "Invalid group GUID '#{guid}'" unless hex.match?(/\A\h{32}\z/)
+
+      parts = [hex[0, 8], hex[8, 4], hex[12, 4]].map { |part| part.scan(/../).reverse.join } + [hex[16, 16]]
+      [parts.join].pack('H*')
     end
   end
 end

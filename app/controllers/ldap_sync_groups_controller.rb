@@ -6,11 +6,14 @@ class LdapSyncGroupsController < ApplicationController
     @logs = SyncLog.recent
     @ldap_auths = AuthSourceLdap.all
     @selected_auth_id = LdapSetting.get('ldap_auth_id').to_i
+    @admin_group_guid = LdapSetting.get('admin_group_guid')
+    @admin_group_name = LdapSetting.get('admin_group_name')
+    @ad_groups = load_ad_groups
   end
-  
+
   def save
     if params[:settings]
-      params[:settings].each do |key, value|
+      params[:settings].except('admin_group_guid').each do |key, value|
         if value.present?
           LdapSetting.set(key, value)
         else
@@ -28,6 +31,10 @@ class LdapSyncGroupsController < ApplicationController
       end
       
       flash[:notice] = "Settings saved successfully"
+
+      if params[:settings].key?('admin_group_guid')
+        save_admin_group(params[:settings]['admin_group_guid'])
+      end
     end
     redirect_to action: :index
   end
@@ -41,6 +48,9 @@ class LdapSyncGroupsController < ApplicationController
       result = service.run
       
       flash[:notice] = "Sync completed: #{result[:users_in_redmine]} users in Redmine, #{result[:groups_processed]} groups, #{result[:users_added]} added, #{result[:users_removed]} removed"
+      if LdapSetting.get('admin_group_guid').present?
+        flash[:notice] += ", admin rights: #{result[:admins_granted]} granted, #{result[:admins_revoked]} revoked"
+      end
       flash[:warning] = "DRY RUN - No changes made" if dry_run
     rescue => e
       flash[:error] = "Sync failed: #{e.message}"
@@ -54,5 +64,44 @@ class LdapSyncGroupsController < ApplicationController
     SyncLog.delete_all
     flash[:notice] = "Logs cleared"
     redirect_to action: :index
+  end
+
+  private
+
+  def directory
+    auth = AuthSourceLdap.find_by(id: LdapSetting.get('ldap_auth_id').to_i)
+    auth && LdapSyncGroups::Directory.from_auth_source(auth)
+  end
+
+  # All groups in the domain, for the admin group dropdown
+  def load_ad_groups
+    dir = directory
+    return [] unless dir
+
+    dir.open { dir.groups(dir.naming_context) }
+  rescue LdapSyncGroups::Directory::Error => e
+    @ad_groups_error = e.message
+    []
+  end
+
+  # Stores the group by its GUID, which survives renames and moves in AD
+  def save_admin_group(guid)
+    if guid.blank?
+      LdapSetting.set('admin_group_guid', '')
+      LdapSetting.set('admin_group_name', '')
+      return
+    end
+    return if guid == LdapSetting.get('admin_group_guid')
+
+    dir = directory
+    group = dir && dir.open { dir.find_group(guid) }
+    if group
+      LdapSetting.set('admin_group_guid', group.guid)
+      LdapSetting.set('admin_group_name', group.name)
+    else
+      flash[:error] = "Admin group not changed: group not found in AD"
+    end
+  rescue LdapSyncGroups::Directory::Error => e
+    flash[:error] = "Admin group not changed: #{e.message}"
   end
 end

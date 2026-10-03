@@ -9,3 +9,6 @@ Redmine::Plugin.register :ldap_sync_groups do
        caption: 'LDAP Sync Groups',
        html: { class: 'icon icon-group' }
 end
+
+# Loading the listener registers the login hook
+LdapSyncGroups::Hooks
