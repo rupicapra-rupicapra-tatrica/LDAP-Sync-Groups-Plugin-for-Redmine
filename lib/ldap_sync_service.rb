@@ -1,21 +1,16 @@
-require 'net/ldap'
-
 class LdapSyncService
   def initialize(dry_run = false)
     @dry_run = dry_run
-    
+
     auth_id = LdapSetting.get('ldap_auth_id').to_i
     @auth = AuthSourceLdap.find_by(id: auth_id)
-    
+
     if @auth.nil?
       raise "No LDAP authentication mode selected. Please configure in plugin settings."
     end
-    
-    @host = @auth.host
-    @port = @auth.port
-    @bind_dn = @auth.account
-    @password = @auth.account_password
-    @users_dn = @auth.base_dn
+
+    @directory = LdapSyncGroups::Directory.from_auth_source(@auth)
+    @membership = LdapSyncGroups::Membership.new(dry_run: @dry_run)
     @groups_dn = LdapSetting.get('ldap_groups_dn')
     @group_prefix = LdapSetting.get('ldap_group_prefix') || ''
     @verbose = LdapSetting.get('verbose_logging') == 'true'
@@ -65,31 +60,30 @@ class LdapSyncService
   
   def run
     log("=== LDAP Sync Started (DRY RUN: #{@dry_run}) ===")
-    
-    ldap = Net::LDAP.new(
-      host: @host,
-      port: @port,
-      encryption: @port == 636 ? :simple_tls : nil,
-      auth: { method: :simple, username: @bind_dn, password: @password }
-    )
-    
-    unless ldap.bind
-      log_error("Cannot bind to LDAP server #{@host}:#{@port}")
+
+    if @groups_dn.blank?
+      raise "No Groups DN configured. Please configure in plugin settings."
+    end
+
+    begin
+      @directory.open do
+        log("--- Syncing users ---")
+        sync_users
+
+        log("--- Syncing groups ---")
+        if @group_prefix.empty?
+          log("Group filter: ALL groups from #{@groups_dn}")
+        else
+          log("Group filter: Only groups with prefix '#{@group_prefix}'")
+        end
+        sync_groups
+      end
+    rescue LdapSyncGroups::Directory::Error => e
+      log_error(e.message)
       send_report if @report_email.present?
-      return @stats
+      raise
     end
-    
-    log("--- Syncing users ---")
-    sync_users(ldap)
-    
-    log("--- Syncing groups ---")
-    if @group_prefix.empty?
-      log("Group filter: ALL groups from #{@groups_dn}")
-    else
-      log("Group filter: Only groups with prefix '#{@group_prefix}'")
-    end
-    sync_groups(ldap)
-    
+
     # Afișare grupuri procesate
     if @all_groups.any?
       log("✅ Groups processed: #{@all_groups.size} groups (#{@all_groups.join(', ')})")
@@ -107,120 +101,72 @@ class LdapSyncService
     @stats
   end
   
-  def sync_users(ldap)
-    filter = Net::LDAP::Filter.eq("objectClass", "user")
-    redmine_users_count = 0
-    
-    ldap.search(base: @users_dn, filter: filter, attributes: ['sAMAccountName', 'userAccountControl']) do |entry|
-      username = entry[:samaccountname]&.first
-      next unless username
-      
-      user = User.find_by(login: username.downcase)
-      if user
-        redmine_users_count += 1
-        @stats[:users_in_redmine] += 1
-      else
-        next
-      end
-      
-      uac = entry[:useraccountcontrol]&.first.to_i
-      disabled = (uac & 2) == 2
-      
-      if disabled && user.active?
-        log("🔒 LOCK user: #{username}")
-        @user_locks << username
-        @changes << "🔒 Locked user: #{username}"
-        unless @dry_run
-          user.lock!
-          user.save!
-        end
+  def sync_users
+    @directory.users.each do |entry|
+      user = User.find_by_login(entry.login)
+      next unless user
+
+      @stats[:users_in_redmine] += 1
+
+      case @membership.apply_account_status(user, entry.disabled)
+      when :locked
+        log("🔒 LOCK user: #{entry.login}")
+        @user_locks << entry.login
+        @changes << "🔒 Locked user: #{entry.login}"
         @stats[:users_locked] += 1
-      elsif !disabled && user.locked?
-        log("🔓 UNLOCK user: #{username}")
-        @user_unlocks << username
-        @changes << "🔓 Unlocked user: #{username}"
-        unless @dry_run
-          user.activate!
-          user.save!
-        end
+      when :unlocked
+        log("🔓 UNLOCK user: #{entry.login}")
+        @user_unlocks << entry.login
+        @changes << "🔓 Unlocked user: #{entry.login}"
         @stats[:users_unlocked] += 1
       end
     end
-    
-    log("✅ Users synced: #{redmine_users_count} in Redmine, #{@user_locks.size} locked, #{@user_unlocks.size} unlocked")
+
+    log("✅ Users synced: #{@stats[:users_in_redmine]} in Redmine, #{@user_locks.size} locked, #{@user_unlocks.size} unlocked")
   end
-  
-  def sync_groups(ldap)
-    filter = Net::LDAP::Filter.eq("objectClass", "group")
-    
-    ldap.search(base: @groups_dn, filter: filter, attributes: ['cn', 'member']) do |entry|
-      cn = entry[:cn]&.first
-      next unless cn
-      
-      if @group_prefix.present? && !cn.start_with?(@group_prefix)
-        next
-      end
-      
-      group_name = cn
+
+  # AD groups managed by the sync
+  def managed_groups
+    @directory.groups(@groups_dn).select { |entry| @group_prefix.empty? || entry.name.start_with?(@group_prefix) }
+  end
+
+  def sync_groups
+    managed_groups.each do |entry|
+      group_name = entry.name
       @stats[:groups_processed] += 1
       @all_groups << group_name
-      
-      # Find or create Redmine group
-      group = Group.find_by(lastname: group_name)
+
+      # Read members first, so a failed lookup never empties or creates a group
+      begin
+        users = @membership.users_by_login(@directory.member_logins(entry.dn))
+      rescue LdapSyncGroups::Directory::Error => e
+        log_error("Group #{group_name} skipped: #{e.message}")
+        next
+      end
+
+      # Find or create Redmine group; in dry run an unsaved group previews the members
+      group = Group.givable.find_by(lastname: group_name)
       group_created = false
-      
-      if group.nil? && !@dry_run
-        group = Group.create(lastname: group_name)
+
+      if group.nil?
+        group = @dry_run ? Group.new(lastname: group_name) : Group.create(lastname: group_name)
+        unless group.persisted? || @dry_run
+          log_error("Cannot create group #{group_name}: #{group.errors.full_messages.join(', ')}")
+          next
+        end
         group_created = true
         @created_groups << group_name
         @changes << "📁 Created group: #{group_name}"
       end
-      
-      if group.nil?
-        next
-      end
-      
-      # Get members from LDAP
-      ldap_members = []
-      added_users = []
-      removed_users = []
-      
-      entry[:member]&.each do |member_dn|
-        cn_match = member_dn.to_s.match(/CN=([^,]+)/i)
-        next unless cn_match
-        
-        cn_username = cn_match[1]
-        
-        # Get sAMAccountName
-        user_filter = Net::LDAP::Filter.eq("distinguishedName", member_dn)
-        sam_account = nil
-        
-        ldap.search(base: @users_dn, filter: user_filter, attributes: ['sAMAccountName']) do |user_entry|
-          sam_account = user_entry[:samaccountname]&.first
-        end
-        
-        username = sam_account || cn_username
-        ldap_members << username.downcase
-        user = User.find_by(login: username.downcase)
-        
-        if user && !group.users.include?(user)
-          group.users << user unless @dry_run
-          @stats[:users_added] += 1
-          added_users << username
-          @changes << "➕ Added user #{username} to group #{group_name}"
-        end
-      end
-      
-      # Remove users not in LDAP group
-      group.users.each do |user|
-        unless ldap_members.include?(user.login.downcase)
-          group.users.delete(user) unless @dry_run
-          @stats[:users_removed] += 1
-          removed_users << user.login
-          @changes << "➖ Removed user #{user.login} from group #{group_name}"
-        end
-      end
-      
+
+      added, removed = @membership.apply_group(group, users)
+      added_users = added.map(&:login)
+      removed_users = removed.map(&:login)
+      @stats[:users_added] += added_users.size
+      @stats[:users_removed] += removed_users.size
+      added_users.each { |u| @changes << "➕ Added user #{u} to group #{group_name}" }
+      removed_users.each { |u| @changes << "➖ Removed user #{u} from group #{group_name}" }
+
       # Log changes
       added_users.each { |u| log("➕ ADD user: #{u} to #{group_name}") }
       removed_users.each { |u| log("➖ REMOVE user: #{u} from #{group_name}") }
