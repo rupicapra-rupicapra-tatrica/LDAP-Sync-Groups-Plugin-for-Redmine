@@ -1,5 +1,5 @@
 <h2>LDAP Sync Groups Plugin</h2>
-<p>Author: Steel..xD | Version 2.2</p>
+<p>Author: Steel..xD | Version <%= Redmine::Plugin.find(:ldap_sync_groups).version %></p>
 
 <%= form_tag({action: 'save'}, method: :post) do %>
   <fieldset>
@@ -19,14 +19,9 @@
   <fieldset>
     <legend>LDAP Sync Settings</legend>
     <p>
-      <label>Groups DN:</label>
-      <%= text_field_tag 'settings[ldap_groups_dn]', LdapSetting.get('ldap_groups_dn'), size: 60 %>
-      <br/><em>Example: OU=Groups,DC=domain,DC=com</em>
-    </p>
-    <p>
-      <label>Group Prefix (optional):</label>
-      <%= text_field_tag 'settings[ldap_group_prefix]', LdapSetting.get('ldap_group_prefix'), size: 20, placeholder: 'Leave empty for ALL groups' %>
-      <br/><em>Leave empty to import ALL groups from the Groups DN</em>
+      <label>Groups DN (optional):</label>
+      <%= text_field_tag 'settings[ldap_groups_dn]', LdapSetting.get('ldap_groups_dn'), size: 60, placeholder: 'Leave empty to list all groups in the domain' %>
+      <br/><em>Limits the "+ Add" dropdown under Synced Groups to this OU. Example: OU=Groups,DC=domain,DC=com</em>
     </p>
     <p>
       <label>
@@ -83,6 +78,54 @@
 
 <hr />
 
+<h3>Synced Groups</h3>
+<p><em>Only these AD groups are synced to Redmine. Members of nested groups count as members.</em></p>
+<% if @synced_groups.any? %>
+  <table class="list" style="width: auto; min-width: 600px;">
+    <thead>
+      <tr><th style="text-align: left;">AD group</th><th style="text-align: left;">Redmine group</th><th>Members</th><th></th></tr>
+    </thead>
+    <tbody>
+      <% @synced_groups.each do |link| %>
+        <tr>
+          <td>
+            <%= link.name %>
+            <% if @ad_groups.any? && @ad_groups.none? { |g| g.guid == link.guid } %>
+              <br/><em style="color: #c00;">Not found in AD - skipped by the sync</em>
+            <% end %>
+          </td>
+          <td><%= link.group ? link_to(link.group.lastname, edit_group_path(link.group)) : content_tag(:em, 'Missing - recreated at the next sync') %></td>
+          <td style="text-align: center;"><%= link.group ? link.group.users.count : '-' %></td>
+          <td>
+            <%= form_tag({action: 'remove_group'}, method: :post, style: 'margin: 0;') do %>
+              <%= hidden_field_tag :id, link.id %>
+              <%= submit_tag '✖ Remove',
+                             data: { confirm: "Remove #{link.name} from the synced groups?\n\nThis DELETES the Redmine group #{link.group&.lastname || link.name}, including the project memberships given through it." },
+                             style: 'background: #c00; color: white; padding: 4px 10px; border: none; border-radius: 3px; cursor: pointer;' %>
+            <% end %>
+          </td>
+        </tr>
+      <% end %>
+    </tbody>
+  </table>
+<% else %>
+  <p><em>No groups selected yet. Nothing is synced until you add a group.</em></p>
+<% end %>
+
+<%= form_tag({action: 'add_group'}, method: :post, style: 'margin-top: 10px;') do %>
+  <% synced_guids = @synced_groups.map(&:guid) %>
+  <%= select_tag :guid,
+                 options_for_select(@addable_groups.reject { |g| synced_guids.include?(g.guid) }.map { |g| [g.name, g.guid] }),
+                 include_blank: 'Select an AD group' %>
+  <%= submit_tag '+ Add', style: 'background: #2a6; color: white; padding: 4px 14px; border: none; border-radius: 3px; cursor: pointer;' %>
+  <br/><em>Adding a group creates its Redmine group right away. If a Redmine group with the same name exists, it is taken over instead.</em>
+  <% if @ad_groups_error %>
+    <br/><em style="color: #c00;">Could not load groups from AD: <%= @ad_groups_error %></em>
+  <% end %>
+<% end %>
+
+<hr />
+
 <!-- Modal pentru Current LDAP Configuration -->
 <div id="configModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000;">
   <div style="background: white; width: 600px; margin: 100px auto; padding: 20px; border-radius: 5px; box-shadow: 0 0 10px rgba(0,0,0,0.3);">
@@ -95,8 +138,8 @@
         <tr><td style="width: 200px; padding: 8px; border-bottom: 1px solid #ddd;"><strong>Name:</strong></td><td style="padding: 8px; border-bottom: 1px solid #ddd;"><%= @auth.name %></td></tr>
         <tr><td style="padding: 8px; border-bottom: 1px solid #ddd;"><strong>Host:</strong></td><td style="padding: 8px; border-bottom: 1px solid #ddd;"><%= @auth.host %>:<%= @auth.port %></td></tr>
         <tr><td style="padding: 8px; border-bottom: 1px solid #ddd;"><strong>Base DN:</strong></td><td style="padding: 8px; border-bottom: 1px solid #ddd;"><%= @auth.base_dn %></td></tr>
-        <tr><td style="padding: 8px; border-bottom: 1px solid #ddd;"><strong>Groups DN:</strong></td><td style="padding: 8px; border-bottom: 1px solid #ddd;"><%= LdapSetting.get('ldap_groups_dn') || 'Not configured' %></td></tr>
-        <tr><td style="padding: 8px; border-bottom: 1px solid #ddd;"><strong>Group Prefix:</strong></td><td style="padding: 8px; border-bottom: 1px solid #ddd;"><%= LdapSetting.get('ldap_group_prefix').presence || 'NONE (all groups)' %></td></tr>
+        <tr><td style="padding: 8px; border-bottom: 1px solid #ddd;"><strong>Groups DN:</strong></td><td style="padding: 8px; border-bottom: 1px solid #ddd;"><%= LdapSetting.get('ldap_groups_dn').presence || 'NONE (whole domain)' %></td></tr>
+        <tr><td style="padding: 8px; border-bottom: 1px solid #ddd;"><strong>Synced Groups:</strong></td><td style="padding: 8px; border-bottom: 1px solid #ddd;"><%= @synced_groups.map(&:name).join(', ').presence || 'NONE' %></td></tr>
         <tr><td style="padding: 8px; border-bottom: 1px solid #ddd;"><strong>Admin Group:</strong></td><td style="padding: 8px; border-bottom: 1px solid #ddd;"><%= @admin_group_name.presence || 'NONE (admin rights not managed)' %></td></tr>
         <tr><td style="padding: 8px; border-bottom: 1px solid #ddd;"><strong>Verbose Logging:</strong></td><td style="padding: 8px; border-bottom: 1px solid #ddd;"><%= LdapSetting.get('verbose_logging') == 'true' ? '✅ Enabled' : '❌ Disabled' %></td></tr>
         <tr><td style="padding: 8px; border-bottom: 1px solid #ddd;"><strong>Report Email:</strong></td><td style="padding: 8px; border-bottom: 1px solid #ddd;"><%= LdapSetting.get('report_email').presence || 'Not configured' %></td></tr>
@@ -141,7 +184,7 @@
       </thead>
       <tbody>
         <% @logs.each do |log| %>
-          <tr style="<%= 'color: #c00;' if log.message.include?('ERROR') %><%= 'color: #2a6;' if log.message.include?('Create') || log.message.include?('ADD') %><%= 'color: #e6b800;' if log.message.include?('LOCK') || log.message.include?('UNLOCK') %><%= 'color: #82c; font-weight: bold;' if log.message.include?('ADMIN') %>">
+          <tr style="<%= 'color: #c00;' if log.message.include?('ERROR') || log.message.include?('Delete group') %><%= 'color: #2a6;' if log.message.include?('Create') || log.message.include?('ADD') %><%= 'color: #82c; font-weight: bold;' if log.message.include?('ADMIN') %><%= 'font-style: italic; background: #fff8dc;' if log.message.start_with?(LdapSyncService::DRY_RUN_PREFIX) %>">
             <td style="white-space: nowrap; padding: 3px 5px;"><%= log.created_at.strftime('%Y-%m-%d %H:%M:%S') %></td>
             <td style="padding: 3px 5px;"><%= log.message %></td>
           </tr>
@@ -164,7 +207,7 @@ function closeModal() {
 
 document.querySelectorAll('input[value="▶ Run Live Sync"]').forEach(btn => {
   btn.closest('form').addEventListener('submit', e => {
-    if(!confirm('WARNING: This will make LIVE changes to your Redmine database!\n- Users will be locked/unlocked\n- Groups will be created/modified\n- Group memberships will be updated\n\nContinue?')) {
+    if(!confirm('WARNING: This will make LIVE changes to your Redmine database!\n- Groups will be created/modified\n- Group memberships will be updated\n- Admin rights will be granted/revoked\n\nContinue?')) {
       e.preventDefault();
     }
   });

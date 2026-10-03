@@ -13,16 +13,16 @@ module LdapSyncGroups
       User.where('LOWER(login) IN (?)', logins.map(&:downcase)).to_a
     end
 
-    # Locks or unlocks the user to match the AD account.
-    # Returns :locked, :unlocked or nil when nothing changes.
-    def apply_account_status(user, disabled)
-      if disabled && user.active?
-        user.lock! unless @dry_run
-        :locked
-      elsif !disabled && user.locked?
-        user.activate! unless @dry_run
-        :unlocked
-      end
+    # The Redmine group with this name, created if missing.
+    # Returns [group, created]; check group.persisted? for creation errors.
+    # In dry-run mode a missing group is returned unsaved.
+    def find_or_create_group(name)
+      group = Group.givable.find_by(lastname: name)
+      return [group, false] if group
+
+      group = Group.new(lastname: name)
+      group.save unless @dry_run
+      [group, true]
     end
 
     # Sets the user's admin flag. Redmine notifies all admins about the change.

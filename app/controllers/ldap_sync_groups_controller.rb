@@ -8,7 +8,59 @@ class LdapSyncGroupsController < ApplicationController
     @selected_auth_id = LdapSetting.get('ldap_auth_id').to_i
     @admin_group_guid = LdapSetting.get('admin_group_guid')
     @admin_group_name = LdapSetting.get('admin_group_name')
-    @ad_groups = load_ad_groups
+    @synced_groups = LdapSyncedGroup.sorted.includes(:group).to_a
+    load_ad_groups
+  end
+
+  # Selects an AD group for syncing and creates its Redmine group right away
+  def add_group
+    guid = params[:guid].to_s
+    if guid.blank?
+      flash[:error] = "Select a group to add"
+    elsif LdapSyncedGroup.exists?(guid: guid)
+      flash[:error] = "This group is already synced"
+    else
+      dir = directory
+      entry = dir && dir.open { dir.find_group(guid) }
+      if entry.nil?
+        flash[:error] = "Group not added: not found in AD"
+      else
+        group, created = LdapSyncGroups::Membership.new.find_or_create_group(entry.name)
+        if !group.persisted?
+          flash[:error] = "Group not added: #{group.errors.full_messages.join(', ')}"
+        elsif LdapSyncedGroup.exists?(group_id: group.id)
+          flash[:error] = "Group not added: the Redmine group #{group.lastname} is already synced from another AD group"
+        else
+          LdapSyncedGroup.create!(guid: entry.guid, name: entry.name, group: group)
+          if created
+            SyncLog.create(message: "📁 Create group: #{entry.name} (added to synced groups)", level: 'info')
+            flash[:notice] = "Added #{entry.name}. Its members are synced at the next sync."
+          else
+            flash[:warning] = "Added #{entry.name}, linked to the existing Redmine group of the same name. " \
+                              "At the next sync its members are replaced by the AD members, and removing it here deletes it."
+          end
+        end
+      end
+    end
+    redirect_to action: :index
+  rescue LdapSyncGroups::Directory::Error => e
+    flash[:error] = "Group not added: #{e.message}"
+    redirect_to action: :index
+  end
+
+  # Stops syncing a group and deletes its Redmine group
+  def remove_group
+    link = LdapSyncedGroup.find_by(id: params[:id])
+    if link
+      name = link.group&.lastname || link.name
+      LdapSyncedGroup.transaction do
+        link.group&.destroy
+        link.destroy
+      end
+      SyncLog.create(message: "🗑 Delete group: #{name} (removed from synced groups)", level: 'info')
+      flash[:notice] = "Removed #{name} and deleted its Redmine group"
+    end
+    redirect_to action: :index
   end
 
   def save
@@ -47,11 +99,11 @@ class LdapSyncGroupsController < ApplicationController
       service = LdapSyncService.new(dry_run)
       result = service.run
       
-      flash[:notice] = "Sync completed: #{result[:users_in_redmine]} users in Redmine, #{result[:groups_processed]} groups, #{result[:users_added]} added, #{result[:users_removed]} removed"
+      flash[:notice] = "Sync completed: #{result[:groups_processed]} groups, #{result[:users_added]} added, #{result[:users_removed]} removed"
       if LdapSetting.get('admin_group_guid').present?
         flash[:notice] += ", admin rights: #{result[:admins_granted]} granted, #{result[:admins_revoked]} revoked"
       end
-      flash[:warning] = "DRY RUN - No changes made" if dry_run
+      flash[:warning] = "DRY RUN - No changes made. The log below shows what a live sync would change." if dry_run
     rescue => e
       flash[:error] = "Sync failed: #{e.message}"
       logger.error "LDAP Sync Error: #{e.backtrace.join("\n")}"
@@ -73,15 +125,20 @@ class LdapSyncGroupsController < ApplicationController
     auth && LdapSyncGroups::Directory.from_auth_source(auth)
   end
 
-  # All groups in the domain, for the admin group dropdown
+  # All groups in the domain for the admin group dropdown, and the groups
+  # below the optional Groups DN for the "+ Add" dropdown
   def load_ad_groups
+    @ad_groups = @addable_groups = []
     dir = directory
-    return [] unless dir
+    return unless dir
 
-    dir.open { dir.groups(dir.naming_context) }
+    dir.open do
+      @ad_groups = dir.groups(dir.naming_context)
+      groups_dn = LdapSetting.get('ldap_groups_dn')
+      @addable_groups = groups_dn.present? ? dir.groups(groups_dn) : @ad_groups
+    end
   rescue LdapSyncGroups::Directory::Error => e
     @ad_groups_error = e.message
-    []
   end
 
   # Stores the group by its GUID, which survives renames and moves in AD

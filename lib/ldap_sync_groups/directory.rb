@@ -7,13 +7,11 @@ module LdapSyncGroups
   class Directory
     class Error < StandardError; end
 
-    User = Struct.new(:dn, :login, :disabled, keyword_init: true)
+    User = Struct.new(:dn, :login, keyword_init: true)
     Group = Struct.new(:dn, :name, :guid, keyword_init: true)
 
     # LDAP_MATCHING_RULE_IN_CHAIN: the server follows nested groups
     IN_CHAIN = '1.2.840.113556.1.4.1941'
-    # userAccountControl flag ACCOUNTDISABLE
-    UAC_DISABLED = 0x2
 
     GROUP_FILTER = Net::LDAP::Filter.eq('objectClass', 'group')
     # objectClass=user alone also matches computer accounts
@@ -59,18 +57,15 @@ module LdapSyncGroups
 
     # The domain root, e.g. DC=ad,DC=example,DC=com
     def naming_context
-      entry = search('', Net::LDAP::Filter.pres('objectClass'), ['defaultNamingContext'], scope: Net::LDAP::SearchScope_BaseObject).first
-      entry && entry[:defaultnamingcontext].first
-    end
-
-    # All user accounts below the users base DN.
-    def users
-      search(@users_base_dn, PERSON_FILTER, [@login_attr, 'userAccountControl']).filter_map { |e| to_user(e) }
+      @naming_context ||= begin
+        entry = search('', Net::LDAP::Filter.pres('objectClass'), ['defaultNamingContext'], scope: Net::LDAP::SearchScope_BaseObject).first
+        entry && entry[:defaultnamingcontext].first
+      end
     end
 
     def find_user(login)
       filter = PERSON_FILTER & Net::LDAP::Filter.equals(@login_attr, login)
-      search(@users_base_dn, filter, [@login_attr, 'userAccountControl']).filter_map { |e| to_user(e) }.first
+      search(@users_base_dn, filter, [@login_attr]).filter_map { |e| to_user(e) }.first
     end
 
     # All groups below base, sorted by name.
@@ -82,12 +77,6 @@ module LdapSyncGroups
     def find_group(guid)
       filter = GROUP_FILTER & Net::LDAP::Filter.bineq('objectGUID', guid_to_binary(guid))
       search(naming_context, filter, %w[cn objectGUID]).map { |e| to_group(e) }.first
-    end
-
-    # True if the user is a member of the group, directly or nested.
-    def member?(user_dn, group_dn)
-      filter = Net::LDAP::Filter.ex("member:#{IN_CHAIN}", Net::LDAP::Filter.escape(user_dn))
-      search(group_dn, filter, ['cn'], scope: Net::LDAP::SearchScope_BaseObject).any?
     end
 
     # Groups below base that the user is a member of, directly or nested.
@@ -120,10 +109,7 @@ module LdapSyncGroups
 
     def to_user(entry)
       login = entry[@login_attr].first
-      return unless login
-
-      uac = entry[:useraccountcontrol].first.to_i
-      User.new(dn: entry.dn, login: login, disabled: (uac & UAC_DISABLED) != 0)
+      User.new(dn: entry.dn, login: login) if login
     end
 
     def to_group(entry)

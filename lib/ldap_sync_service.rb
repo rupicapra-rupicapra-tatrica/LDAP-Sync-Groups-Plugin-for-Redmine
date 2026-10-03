@@ -1,6 +1,8 @@
 class LdapSyncService
   # Seconds the LDAP reads of a login sync may take
   LOGIN_TIMEOUT = 10
+  # Marks dry-run log entries, so the log shows what a live sync would do
+  DRY_RUN_PREFIX = '🔍 DRY RUN | '
 
   def initialize(dry_run = false)
     @dry_run = dry_run
@@ -14,18 +16,13 @@ class LdapSyncService
 
     @directory = LdapSyncGroups::Directory.from_auth_source(@auth)
     @membership = LdapSyncGroups::Membership.new(dry_run: @dry_run)
-    @groups_dn = LdapSetting.get('ldap_groups_dn')
-    @group_prefix = LdapSetting.get('ldap_group_prefix') || ''
     @admin_group_guid = LdapSetting.get('admin_group_guid')
     @admin_group_name = LdapSetting.get('admin_group_name')
     @verbose = LdapSetting.get('verbose_logging') == 'true'
     @report_email = LdapSetting.get('report_email')
     @send_report_only_on_changes = LdapSetting.get('send_report_only_on_changes') == 'true'
     
-    @stats = { 
-      users_in_redmine: 0,
-      users_locked: 0, 
-      users_unlocked: 0, 
+    @stats = {
       groups_processed: 0, 
       users_added: 0,
       users_removed: 0,
@@ -36,54 +33,42 @@ class LdapSyncService
     @created_groups = []
     @unchanged_groups = []
     @changes = []
-    @user_locks = []
-    @user_unlocks = []
     @all_groups = []
   end
   
   def log(msg, level = 'info')
     puts "[#{Time.now}] #{msg}"
     
-    unless @dry_run
-      if @verbose
-        SyncLog.create(message: msg, level: level)
-      else
-        important_patterns = ['===', '---', 'Group filter', '✅ Groups processed', 
-                              '✅ Users synced', '📊', '✓ No changes', 'ADD user', 
-                              'REMOVE user', 'LOCK user', 'UNLOCK user', 'Create group',
-                              'Admin group', 'ADMIN']
-        
-        if important_patterns.any? { |pattern| msg.include?(pattern) }
-          SyncLog.create(message: msg, level: level)
-        end
+    if @verbose
+      store_log(msg, level)
+    else
+      important_patterns = ['===', '---', 'Synced groups', '✅ Groups processed',
+                            '📊', '✓ No changes', 'ADD user',
+                            'REMOVE user', 'Create group',
+                            'Rename group', 'Admin group', 'ADMIN']
+      
+      if important_patterns.any? { |pattern| msg.include?(pattern) }
+        store_log(msg, level)
       end
     end
   end
   
   def log_error(msg)
     puts "[#{Time.now}] ERROR: #{msg}"
-    SyncLog.create(message: "ERROR: #{msg}", level: 'error') unless @dry_run
+    store_log("ERROR: #{msg}", 'error')
     @changes << "ERROR: #{msg}"
+  end
+  
+  def store_log(msg, level)
+    SyncLog.create(message: @dry_run ? "#{DRY_RUN_PREFIX}#{msg}" : msg, level: level)
   end
   
   def run
     log("=== LDAP Sync Started (DRY RUN: #{@dry_run}) ===")
 
-    if @groups_dn.blank?
-      raise "No Groups DN configured. Please configure in plugin settings."
-    end
-
     begin
       @directory.open do
-        log("--- Syncing users ---")
-        sync_users
-
         log("--- Syncing groups ---")
-        if @group_prefix.empty?
-          log("Group filter: ALL groups from #{@groups_dn}")
-        else
-          log("Group filter: Only groups with prefix '#{@group_prefix}'")
-        end
         sync_groups
 
         if @admin_group_guid.present?
@@ -104,7 +89,6 @@ class LdapSyncService
       log("✅ Groups processed: #{@stats[:groups_processed]}")
     end
     
-    log("📊 Users in Redmine: #{@stats[:users_in_redmine]}, Locked: #{@stats[:users_locked]}, Unlocked: #{@stats[:users_unlocked]}")
     log("📊 Groups: #{@stats[:groups_processed]} processed, #{@stats[:users_added]} added, #{@stats[:users_removed]} removed")
     log("📊 Admin rights: #{@stats[:admins_granted]} granted, #{@stats[:admins_revoked]} revoked") if @admin_group_guid.present?
     log("=== Sync Complete ===")
@@ -115,37 +99,27 @@ class LdapSyncService
     @stats
   end
   
-  def sync_users
-    @directory.users.each do |entry|
-      user = User.find_by_login(entry.login)
-      next unless user
-
-      @stats[:users_in_redmine] += 1
-
-      case @membership.apply_account_status(user, entry.disabled)
-      when :locked
-        log("🔒 LOCK user: #{entry.login}")
-        @user_locks << entry.login
-        @changes << "🔒 Locked user: #{entry.login}"
-        @stats[:users_locked] += 1
-      when :unlocked
-        log("🔓 UNLOCK user: #{entry.login}")
-        @user_unlocks << entry.login
-        @changes << "🔓 Unlocked user: #{entry.login}"
-        @stats[:users_unlocked] += 1
-      end
-    end
-
-    log("✅ Users synced: #{@stats[:users_in_redmine]} in Redmine, #{@user_locks.size} locked, #{@user_unlocks.size} unlocked")
+  # All AD groups by GUID, read once per run
+  def ad_groups_by_guid
+    @ad_groups_by_guid ||= @directory.groups(@directory.naming_context).index_by(&:guid)
   end
 
-  # AD groups managed by the sync
-  def managed_groups
-    @directory.groups(@groups_dn).select { |entry| @group_prefix.empty? || entry.name.start_with?(@group_prefix) }
+  # The groups selected in the plugin settings, each with its AD group (nil when gone from AD)
+  def synced_groups
+    LdapSyncedGroup.sorted.includes(:group).map { |link| [link, ad_groups_by_guid[link.guid]] }
   end
 
   def sync_groups
-    managed_groups.each do |entry|
+    links = synced_groups
+    log("Synced groups: #{links.size} selected")
+
+    links.each do |link, entry|
+      # A group missing from AD may be a directory problem, so its Redmine group is left alone
+      unless entry
+        log_error("AD group #{link.name} (GUID #{link.guid}) not found - group skipped")
+        next
+      end
+
       group_name = entry.name
       @stats[:groups_processed] += 1
       @all_groups << group_name
@@ -158,20 +132,37 @@ class LdapSyncService
         next
       end
 
-      # Find or create Redmine group; in dry run an unsaved group previews the members
-      group = Group.givable.find_by(lastname: group_name)
+      # Recreate the Redmine group if it was deleted; in dry run an unsaved group previews the members
+      group = link.group
       group_created = false
 
       if group.nil?
-        group = @dry_run ? Group.new(lastname: group_name) : Group.create(lastname: group_name)
+        group, group_created = @membership.find_or_create_group(group_name)
         unless group.persisted? || @dry_run
           log_error("Cannot create group #{group_name}: #{group.errors.full_messages.join(', ')}")
           next
         end
-        group_created = true
-        @created_groups << group_name
-        @changes << "📁 Created group: #{group_name}"
+        if group.persisted? && LdapSyncedGroup.where(group_id: group.id).where.not(id: link.id).exists?
+          log_error("Group #{group_name} skipped: its Redmine group is already synced from another AD group")
+          next
+        end
+        link.update!(group: group) unless @dry_run
+        if group_created
+          @created_groups << group_name
+          @changes << "📁 Created group: #{group_name}"
+        end
+      elsif group.lastname != group_name
+        # The AD group was renamed
+        old_name = group.lastname
+        if @dry_run || group.update(lastname: group_name)
+          log("✏️ Rename group: #{old_name} → #{group_name}")
+          @changes << "✏️ Renamed group: #{old_name} → #{group_name}"
+        else
+          log_error("Cannot rename group #{old_name} to #{group_name}: #{group.errors.full_messages.join(', ')}")
+          group.restore_attributes
+        end
       end
+      link.update!(name: group_name) unless @dry_run || link.name == group_name
 
       added, removed = @membership.apply_group(group, users)
       added_users = added.map(&:login)
@@ -226,38 +217,35 @@ class LdapSyncService
   def sync_user(user)
     return unless user.auth_source_id == @auth.id
 
-    entry = managed = member_of = admin_group = nil
-    is_admin = false
+    entry = admin_group = nil
+    user_guids = []
     Timeout.timeout(LOGIN_TIMEOUT) do
       @directory.open do
         entry = @directory.find_user(user.login)
         if entry
-          if @groups_dn.present?
-            managed = managed_groups
-            member_of = @directory.groups_of(entry.dn, @groups_dn)
-          end
+          user_guids = @directory.groups_of(entry.dn, @directory.naming_context).map(&:guid)
+          ad_groups_by_guid
           admin_group = find_admin_group
-          is_admin = admin_group && @directory.member?(entry.dn, admin_group.dn)
         end
       end
     end
     return unless entry
 
-    if managed
-      groups = Group.givable.where(lastname: managed.map(&:name)).to_a
-      user_groups = groups.select { |group| member_of.any? { |g| g.name == group.lastname } }
-      joined, left = @membership.apply_user(user, groups, user_groups)
-      joined.each do |group|
-        log("➕ ADD user: #{user.login} to #{group.lastname} (at login)")
-        @stats[:users_added] += 1
-      end
-      left.each do |group|
-        log("➖ REMOVE user: #{user.login} from #{group.lastname} (at login)")
-        @stats[:users_removed] += 1
-      end
+    # As in the full sync, groups missing from AD or Redmine are left alone
+    links = LdapSyncedGroup.includes(:group).select { |link| link.group && ad_groups_by_guid.key?(link.guid) }
+    groups = links.map(&:group)
+    user_groups = links.select { |link| user_guids.include?(link.guid) }.map(&:group)
+    joined, left = @membership.apply_user(user, groups, user_groups)
+    joined.each do |group|
+      log("➕ ADD user: #{user.login} to #{group.lastname} (at login)")
+      @stats[:users_added] += 1
+    end
+    left.each do |group|
+      log("➖ REMOVE user: #{user.login} from #{group.lastname} (at login)")
+      @stats[:users_removed] += 1
     end
 
-    apply_admin_rights({ user => is_admin }, ' (at login)') if admin_group
+    apply_admin_rights({ user => user_guids.include?(admin_group.guid) }, ' (at login)') if admin_group
     @stats
   end
 
@@ -265,7 +253,7 @@ class LdapSyncService
   def find_admin_group
     return if @admin_group_guid.blank?
 
-    group = @directory.find_group(@admin_group_guid)
+    group = ad_groups_by_guid[@admin_group_guid]
     log_error("Admin group #{@admin_group_name} not found in AD - admin rights left unchanged") unless group
     group
   end
@@ -313,7 +301,6 @@ class LdapSyncService
     if @changes.empty?
       body = "No changes detected during LDAP synchronization.\n\n"
       body += "=== Statistics ===\n"
-      body += "Users in Redmine: #{@stats[:users_in_redmine]}\n"
       body += "Groups processed: #{@stats[:groups_processed]} groups\n"
       if @all_groups.any?
         body += "Groups list: #{@all_groups.join(', ')}\n"
@@ -325,9 +312,6 @@ class LdapSyncService
       body += "Dry run: #{@dry_run ? 'Yes (no changes applied)' : 'No'}\n\n"
       
       body += "=== Statistics ===\n"
-      body += "Users in Redmine: #{@stats[:users_in_redmine]}\n"
-      body += "Users locked: #{@stats[:users_locked]}\n"
-      body += "Users unlocked: #{@stats[:users_unlocked]}\n"
       body += "Groups processed: #{@stats[:groups_processed]} groups\n"
       if @all_groups.any?
         body += "Groups list: #{@all_groups.join(', ')}\n"
@@ -347,7 +331,7 @@ class LdapSyncService
     end
     
     body += "\n---\n"
-    body += "LDAP Sync Plugin v2.2 | Steel..xD"
+    body += "LDAP Sync Plugin v#{Redmine::Plugin.find(:ldap_sync_groups).version} | Steel..xD"
     
     begin
       ActionMailer::Base.mail(

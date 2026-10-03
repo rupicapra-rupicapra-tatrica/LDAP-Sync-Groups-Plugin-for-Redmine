@@ -3,8 +3,7 @@ class SyncLog < ActiveRecord::Base
   
   scope :recent, -> { order(created_at: :desc).limit(100) }
   scope :errors, -> { where("message LIKE ?", "%ERROR%") }
-  scope :changes, -> { where("message LIKE ? OR message LIKE ? OR message LIKE ?", 
-                              "%LOCK%", "%UNLOCK%", "%ADD%", "%REMOVE%") }
+  scope :changes, -> { where("message LIKE ? OR message LIKE ?", "%ADD%", "%REMOVE%") }
   
   def self.add(message, level = 'info')
     # Don't log verbose member details unless they are changes
