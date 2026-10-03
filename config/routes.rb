@@ -1,6 +1,7 @@
 get  'ldap_sync_groups', to: 'ldap_sync_groups#index'
 post 'ldap_sync_groups/save', to: 'ldap_sync_groups#save'
 post 'ldap_sync_groups/sync', to: 'ldap_sync_groups#sync'
+post 'ldap_sync_groups/sync_user', to: 'ldap_sync_groups#sync_user'
 post 'ldap_sync_groups/clear_logs', to: 'ldap_sync_groups#clear_logs'
 post 'ldap_sync_groups/add_group', to: 'ldap_sync_groups#add_group'
 post 'ldap_sync_groups/remove_group', to: 'ldap_sync_groups#remove_group'

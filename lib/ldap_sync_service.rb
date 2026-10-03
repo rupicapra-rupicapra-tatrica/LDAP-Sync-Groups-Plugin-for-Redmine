@@ -1,8 +1,14 @@
 class LdapSyncService
+  # The plugin settings are incomplete
+  class ConfigurationError < StandardError; end
+  
   # Seconds the LDAP reads of a login sync may take
   LOGIN_TIMEOUT = 10
   # Marks dry-run log entries, so the log shows what a live sync would do
   DRY_RUN_PREFIX = '🔍 DRY RUN | '
+
+  # Errors logged during the run
+  attr_reader :errors
 
   def initialize(dry_run = false)
     @dry_run = dry_run
@@ -11,7 +17,7 @@ class LdapSyncService
     @auth = AuthSourceLdap.find_by(id: auth_id)
 
     if @auth.nil?
-      raise "No LDAP authentication mode selected. Please configure in plugin settings."
+      raise ConfigurationError, "No LDAP authentication mode selected. Please configure in plugin settings."
     end
 
     @directory = LdapSyncGroups::Directory.from_auth_source(@auth)
@@ -33,6 +39,7 @@ class LdapSyncService
     @created_groups = []
     @unchanged_groups = []
     @changes = []
+    @errors = []
     @all_groups = []
   end
   
@@ -45,7 +52,7 @@ class LdapSyncService
       important_patterns = ['===', '---', 'Synced groups', '✅ Groups processed',
                             '📊', '✓ No changes', 'ADD user',
                             'REMOVE user', 'Create group',
-                            'Rename group', 'Admin group', 'ADMIN']
+                            'Rename group', 'Admin group', 'ADMIN', 'not found in AD']
       
       if important_patterns.any? { |pattern| msg.include?(pattern) }
         store_log(msg, level)
@@ -57,6 +64,7 @@ class LdapSyncService
     puts "[#{Time.now}] ERROR: #{msg}"
     store_log("ERROR: #{msg}", 'error')
     @changes << "ERROR: #{msg}"
+    @errors << msg
   end
   
   def store_log(msg, level)
@@ -212,24 +220,25 @@ class LdapSyncService
     apply_admin_rights(users.to_h { |user| [user, admin_logins.include?(user.login.downcase)] })
   end
 
-  # Syncs one user's group memberships and admin rights, used at login.
-  # All LDAP reads finish under a time limit before anything is written.
-  def sync_user(user)
+  # Syncs one user's group memberships and admin rights, used at login and
+  # through the API. All LDAP reads finish under a time limit before anything
+  # is written. Returns what changed, or nil for users this plugin doesn't manage.
+  def sync_user(user, source = 'at login')
     return unless user.auth_source_id == @auth.id
 
+    note = " (#{source})"
     entry = admin_group = nil
     user_guids = []
     Timeout.timeout(LOGIN_TIMEOUT) do
       @directory.open do
         entry = @directory.find_user(user.login)
-        if entry
-          user_guids = @directory.groups_of(entry.dn, @directory.naming_context).map(&:guid)
-          ad_groups_by_guid
-          admin_group = find_admin_group
-        end
+        user_guids = @directory.groups_of(entry.dn, @directory.naming_context).map(&:guid) if entry
+        ad_groups_by_guid
+        admin_group = find_admin_group
       end
     end
-    return unless entry
+    # A user deleted from AD or moved out of the Base DN is a member of nothing, as in the full sync
+    log("⚠ User #{user.login} not found in AD below the Base DN - treated as member of no group#{note}") unless entry
 
     # As in the full sync, groups missing from AD or Redmine are left alone
     links = LdapSyncedGroup.includes(:group).select { |link| link.group && ad_groups_by_guid.key?(link.guid) }
@@ -237,16 +246,25 @@ class LdapSyncService
     user_groups = links.select { |link| user_guids.include?(link.guid) }.map(&:group)
     joined, left = @membership.apply_user(user, groups, user_groups)
     joined.each do |group|
-      log("➕ ADD user: #{user.login} to #{group.lastname} (at login)")
+      log("➕ ADD user: #{user.login} to #{group.lastname}#{note}")
       @stats[:users_added] += 1
     end
     left.each do |group|
-      log("➖ REMOVE user: #{user.login} from #{group.lastname} (at login)")
+      log("➖ REMOVE user: #{user.login} from #{group.lastname}#{note}")
       @stats[:users_removed] += 1
     end
 
-    apply_admin_rights({ user => user_guids.include?(admin_group.guid) }, ' (at login)') if admin_group
-    @stats
+    apply_admin_rights({ user => user_guids.include?(admin_group.guid) }, note) if admin_group
+    
+    {
+      login: user.login,
+      found_in_ad: !entry.nil?,
+      groups_added: joined.map(&:lastname),
+      groups_removed: left.map(&:lastname),
+      admin_granted: @stats[:admins_granted] > 0,
+      admin_revoked: @stats[:admins_revoked] > 0,
+      errors: @errors
+    }
   end
 
   # The configured AD admin group, or nil when none is set or it is gone from AD

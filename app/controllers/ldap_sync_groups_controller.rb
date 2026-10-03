@@ -1,6 +1,8 @@
 class LdapSyncGroupsController < ApplicationController
   layout 'admin'
   before_action :require_admin
+  # sync.json and sync_user.json accept an admin's API key
+  accept_api_auth :sync, :sync_user
   
   def index
     @logs = SyncLog.recent
@@ -92,24 +94,55 @@ class LdapSyncGroupsController < ApplicationController
   end
   
   def sync
-    dry_run = params[:dry_run] == '1'
+    dry_run = dry_run?
     
     begin
       require_relative '../../lib/ldap_sync_service'
       service = LdapSyncService.new(dry_run)
       result = service.run
-      
-      flash[:notice] = "Sync completed: #{result[:groups_processed]} groups, #{result[:users_added]} added, #{result[:users_removed]} removed"
-      if LdapSetting.get('admin_group_guid').present?
-        flash[:notice] += ", admin rights: #{result[:admins_granted]} granted, #{result[:admins_revoked]} revoked"
-      end
-      flash[:warning] = "DRY RUN - No changes made. The log below shows what a live sync would change." if dry_run
     rescue => e
-      flash[:error] = "Sync failed: #{e.message}"
       logger.error "LDAP Sync Error: #{e.backtrace.join("\n")}"
+      return respond_to do |format|
+        format.html do
+          flash[:error] = "Sync failed: #{e.message}"
+          redirect_to action: :index
+        end
+        format.json { render_sync_error(e) }
+      end
     end
     
-    redirect_to action: :index
+    respond_to do |format|
+      format.html do
+        flash[:notice] = "Sync completed: #{result[:groups_processed]} groups, #{result[:users_added]} added, #{result[:users_removed]} removed"
+        if LdapSetting.get('admin_group_guid').present?
+          flash[:notice] += ", admin rights: #{result[:admins_granted]} granted, #{result[:admins_revoked]} revoked"
+        end
+        flash[:warning] = "DRY RUN - No changes made. The log below shows what a live sync would change." if dry_run
+        redirect_to action: :index
+      end
+      format.json { render json: result.merge(dry_run: dry_run, errors: service.errors) }
+    end
+  end
+  
+  # API only: syncs one user's group memberships and admin rights from AD
+  def sync_user
+    return head(:not_acceptable) unless api_request?
+    
+    user = User.find_by_login(params[:login].to_s)
+    unless user
+      return render json: { errors: ["No Redmine user with login '#{params[:login]}'"] }, status: :not_found
+    end
+    unless user.auth_source_id.present? && user.auth_source_id == LdapSetting.get('ldap_auth_id').to_i
+      return render json: { errors: ["User #{user.login} doesn't log in through the selected LDAP authentication mode, so the plugin doesn't manage them"] },
+                    status: :unprocessable_entity
+    end
+    
+    dry_run = dry_run?
+    result = LdapSyncService.new(dry_run).sync_user(user, 'API')
+    render json: result.merge(dry_run: dry_run)
+  rescue => e
+    logger.error "LDAP Sync Error: #{e.backtrace.join("\n")}"
+    render_sync_error(e)
   end
   
   def clear_logs
@@ -119,6 +152,21 @@ class LdapSyncGroupsController < ApplicationController
   end
 
   private
+  
+  def dry_run?
+    %w[1 true].include?(params[:dry_run].to_s)
+  end
+  
+  # Configuration problems need fixing; directory problems are worth retrying
+  def render_sync_error(error)
+    status =
+      case error
+      when LdapSyncService::ConfigurationError then :unprocessable_entity
+      when LdapSyncGroups::Directory::Error, Timeout::Error then :service_unavailable
+      else :internal_server_error
+      end
+    render json: { errors: [error.message] }, status: status
+  end
 
   def directory
     auth = AuthSourceLdap.find_by(id: LdapSetting.get('ldap_auth_id').to_i)

@@ -12,6 +12,7 @@ Keeps Redmine in line with Active Directory: mirrors the AD groups you choose in
 - [Configuration](#configuration)
 - [What a sync does](#what-a-sync-does)
 - [Running a sync](#running-a-sync)
+- [REST API](#rest-api)
 - [Logs and reports](#logs-and-reports)
 - [Troubleshooting](#troubleshooting)
 - [Limitations](#limitations)
@@ -26,6 +27,7 @@ Keeps Redmine in line with Active Directory: mirrors the AD groups you choose in
 - **Nested groups count everywhere.** A member of a group inside a synced group is a member of the synced group.
 - **Admin group:** members of one AD group become Redmine administrators; everyone else from AD loses admin rights.
 - **Sync at login:** a user's group memberships and admin rights are refreshed every time they log in.
+- **REST API:** start a full sync, or sync a single user, from another system with an admin API key.
 - **Dry run:** preview every change in the log before applying it.
 - **Safe on failure:** if AD can't be read, nothing is changed; a login never fails because of the plugin.
 - **Email report** after each sync, optionally only when something changed.
@@ -98,17 +100,18 @@ Click **Save Settings**.
 
 ### Full sync
 
-Started from the admin page or from cron. It runs these steps in order:
+Started from the admin page, from cron or through the [REST API](#rest-api). It runs these steps in order:
 
 1. **Groups.** For every synced group, the Redmine group's members are made exactly the AD group's members, nested members included. Redmine users not in the AD group are removed from it, even if they were added by hand. Groups that were renamed in AD are renamed; Redmine groups deleted by hand are recreated.
 2. **Admin rights.** If an admin group is set, admin rights are granted and removed as described under [Admin group](#3-admin-group-optional).
 
-### Sync at login
+### Single-user sync (at login and through the API)
 
-Every time a user of the selected LDAP authentication mode logs in, their membership in the synced groups and their admin rights are updated from AD. This includes users that Redmine creates automatically at their first login (*On-the-fly user creation* in the authentication mode), so they get their groups and rights straight away.
+Updates one user's membership in the synced groups and their admin rights from AD. It runs every time a user of the selected LDAP authentication mode logs in, and when [`sync_user.json`](#sync-one-user) is called. This includes users that Redmine creates automatically at their first login (*On-the-fly user creation* in the authentication mode), so they get their groups and rights straight away.
 
-- The AD lookups are limited to 10 seconds. If AD can't be reached, the login still succeeds and the error is logged.
-- Groups are not created at login, and groups missing from AD are left alone.
+- The AD lookups are limited to 10 seconds. At login, if AD can't be reached, the login still succeeds and the error is logged.
+- A user who no longer exists below the Base DN in AD (deleted, or moved elsewhere) is removed from all synced groups and loses admin rights, the same as in a full sync.
+- Groups are not created or renamed, and groups missing from AD are left alone. A full sync does that.
 
 ### Safety rules
 
@@ -135,11 +138,77 @@ cd /path/to/redmine && bundle exec bin/rails runner -e production 'LdapSyncServi
 
 The command exits with a non-zero status when the sync fails (for example when AD is unreachable), so your monitoring can pick it up.
 
+## REST API
+
+Both endpoints wait for the sync to finish and return the result as JSON.
+
+**Setup**
+
+1. Enable the API in *Administration → Settings → API → Enable REST web service*.
+2. Use the API key of a **local** administrator account (*My account → API access key*). An administrator from AD could lose admin rights through the admin group, and the key would stop working.
+3. Send the key in the `X-Redmine-API-Key` header rather than as a `key=` parameter, so it doesn't end up in web server logs.
+
+Add `dry_run=1` (or `dry_run=true`) to either endpoint to get the would-be changes without making them.
+
+### Full sync
+
+```bash
+curl -X POST -H "X-Redmine-API-Key: $KEY" "https://redmine.example.com/ldap_sync_groups/sync.json"
+```
+
+```json
+{"groups_processed": 6, "users_added": 1, "users_removed": 0, "admins_granted": 0, "admins_revoked": 0, "dry_run": false, "errors": []}
+```
+
+`errors` lists problems that didn't stop the sync, such as a synced group missing from AD.
+
+### Sync one user
+
+```bash
+curl -X POST -H "X-Redmine-API-Key: $KEY" "https://redmine.example.com/ldap_sync_groups/sync_user.json?login=jdoe"
+```
+
+```json
+{"login": "jdoe", "found_in_ad": true, "groups_added": ["Developers"], "groups_removed": [], "admin_granted": false, "admin_revoked": false, "errors": [], "dry_run": false}
+```
+
+`login` is the Redmine login, which is matched case-insensitively. `found_in_ad: false` means the user no longer exists below the Base DN, so they were removed from all synced groups and lost admin rights.
+
+### Responses
+
+| Status | Meaning | What to do |
+|---|---|---|
+| `200` | Synced. The body describes the changes. | Nothing. |
+| `401` | No or unknown API key. | Check the key. |
+| `403` | The key's owner isn't an administrator, or the REST API is disabled. | Use a local admin's key; enable the REST API. |
+| `404` | `sync_user`: no Redmine user with that login. | Nothing to sync. Users are created when they first log in. |
+| `422` | `sync_user`: the user doesn't log in through the selected LDAP authentication mode, so the plugin doesn't manage them. `sync`: the plugin isn't configured. | Ignore for `sync_user`; fix the settings for `sync`. |
+| `503` | AD couldn't be read (unreachable, timed out, bind or search failed). Nothing was changed. | Retry later. |
+| `500` | Unexpected error, details in the Redmine log. | Investigate. |
+
+Errors come as `{"errors": ["…"]}`.
+
+### Which call for which AD change
+
+For a script that watches AD and keeps Redmine up to date between full syncs:
+
+| Change in AD | Call |
+|---|---|
+| A user is added to or removed from a group, directly or through a nested group | `sync_user` for that user |
+| A user is deleted, or moved out of the Base DN | `sync_user` with their Redmine login |
+| A user's login (`sAMAccountName`) is renamed | `sync_user` with the **old** login: the old Redmine account loses its groups and admin rights. The plugin doesn't rename Redmine users. |
+| A group is added to or removed from another group (nesting changes) | Full `sync`: it can affect every member of the nested group |
+| A synced group or the admin group is renamed or moved | Full `sync` |
+| A synced group or the admin group is deleted | Nothing changes automatically; remove the group on the admin page |
+| A user is created, disabled or enabled | Nothing. The plugin doesn't create, lock or unlock users. |
+
+Calling `sync_user` for a user that isn't affected is harmless and changes nothing. A watcher doesn't need to know which groups are synced: it can call `sync_user` for every user whose group memberships changed, and a full `sync` for every change to a group's group members.
+
 ## Logs and reports
 
 - The admin page shows the latest 100 log entries. Errors and deleted groups are red, additions and new groups green, admin changes purple, and dry-run entries highlighted. **🗑 Clear Logs** deletes them all.
-- Login syncs log only actual changes, marked `(at login)`, and errors as `Login sync for <login> failed: …`.
-- The email report lists the statistics and every change of a full sync, including errors. Login syncs don't send reports.
+- Single-user syncs log only actual changes, marked `(at login)` or `(API)`. Failed login syncs are logged as `Login sync for <login> failed: …`.
+- The email report lists the statistics and every change of a full sync, including errors. Single-user syncs don't send reports.
 
 ## Troubleshooting
 
@@ -173,7 +242,7 @@ end'
 - Works with one LDAP authentication mode at a time.
 - Doesn't create or delete Redmine users.
 - Doesn't lock or unlock Redmine users. Disabling an account in AD stops new logins, because Redmine checks the password against AD, but existing sessions, *Stay logged in* cookies and API keys keep working until you lock the user in Redmine.
-- Group membership changes in AD reach Redmine at the next full sync, or at the user's next login.
+- Group membership changes in AD reach Redmine at the next full sync, at the user's next login, or when the [API](#rest-api) is called.
 - Membership through a user's primary group (normally *Domain Users*) isn't detected.
 - Redmine group names are unique. Two AD groups with the same name in different OUs can't both be synced.
 
@@ -209,6 +278,7 @@ Then restart Redmine. This removes the plugin's settings, logs and list of synce
 - A failed AD lookup no longer empties a group; a failed connection shows *Sync failed* instead of a success message.
 - Uses the authentication mode's LDAPS, certificate and timeout settings instead of guessing from the port.
 - Dry runs show every would-be change in the log.
+- REST API: `sync.json` and `sync_user.json` start a full or single-user sync with an admin API key.
 - Computer accounts in AD groups are ignored.
 - Removed: locking and unlocking users based on their AD account status.
 
